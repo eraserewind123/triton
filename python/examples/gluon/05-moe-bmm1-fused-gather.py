@@ -511,9 +511,9 @@ def apply_bias_and_scale(
     acc_ready_bar = p.acc_ready_bars.index(idx)
     acc_buf = p.acc_bufs.index(idx)
 
-    offs_bias_n = off_n + gl.arange(0, p.BLOCK_N, layout=bias_layout)
+    offs_bias_n = gl.arange(0, p.BLOCK_N, layout=bias_layout)
     bias = gl.convert_layout(
-        gl.expand_dims(gl.load(p.bias_ptr + slice_idx * p.bias_stride + offs_bias_n), axis=0),
+        gl.expand_dims(gl.load(p.bias_ptr + (slice_idx * p.bias_stride + off_n) + offs_bias_n), axis=0),
         split_layout,
     )
     mbarrier.wait(acc_ready_bar, phase)
@@ -1258,6 +1258,7 @@ class PreparedCase:
     y_scale: torch.Tensor
     out_shape: tuple[int, int]
     out_dtype: torch.dtype
+    kernel_config: KernelConfig | None = None
 
 
 def alloc_randn(shape: tuple[int, ...], dtype: torch.dtype, device: str) -> torch.Tensor:
@@ -1381,6 +1382,7 @@ def prepare_case(c: MLPConfig, batch_size: int, device: str, seed: int = 0, unif
         y_scale=y_scale,
         out_shape=(batch_size * c.experts_per_token, n // fused_activation.specs.reduction_n),
         out_dtype=torch.float8_e4m3fn,
+        kernel_config=p,
     )
 
 
@@ -1403,7 +1405,7 @@ def make_output_buffer(prepared: PreparedCase) -> torch.Tensor:
 
 
 def run_kernel(prepared: PreparedCase, kernel, precision_config: PrecisionConfig, out: torch.Tensor) -> torch.Tensor:
-    return kernel(
+    kwargs = dict(
         a=prepared.x,
         b=prepared.w,
         bias=prepared.bias,
@@ -1413,6 +1415,9 @@ def run_kernel(prepared: PreparedCase, kernel, precision_config: PrecisionConfig
         c=out,
         fused_activation=prepared.fused_activation,
     )
+    if kernel is matmul and prepared.kernel_config is not None:
+        kwargs["p"] = prepared.kernel_config
+    return kernel(**kwargs)
 
 
 def run_provider(prepared: PreparedCase, provider: str) -> tuple[torch.Tensor, PrecisionConfig]:
@@ -1445,12 +1450,12 @@ def estimate_benchmark_work(c: MLPConfig, prepared: PreparedCase) -> tuple[int, 
     return flops, nbytes
 
 
-def benchmark_kernel(prepared: PreparedCase, kernel, flops: int, nbytes: int) -> tuple[float, float]:
+def benchmark_kernel(prepared: PreparedCase, kernel, flops: int, nbytes: int) -> tuple[float, float, float]:
     precision_config = make_precision_config(prepared)
     out = make_output_buffer(prepared)
     ms = do_bench_cudagraph(lambda: run_kernel(prepared, kernel, precision_config, out))
     seconds = ms * 1e-3
-    return flops * 1e-12 / seconds, nbytes * 1e-12 / seconds
+    return flops * 1e-12 / seconds, nbytes * 1e-12 / seconds, ms * 1e3
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1561,29 +1566,36 @@ def test_op_fpsan():
 # Benchmarking
 # ===-----------------------------------------------------------------------===#
 
-BENCH_TITLE = ("GPT-OSS-120B MoE MM1 "
-               f"E={GPT_OSS_120B_CONFIG.num_experts} "
-               f"EP={GPT_OSS_120B_CONFIG.experts_per_token} "
-               f"ES={GPT_OSS_120B_CONFIG.num_expert_shards} "
-               f"B={GPT_OSS_120B_CONFIG.hidden_size}x{GPT_OSS_120B_CONFIG.intermediate_size}")
 PEAK_TFLOPS = 5_000.0
 PEAK_TBPS = 8.0
 
 
-def _format_perf(result: tuple[float, float]) -> str:
-    tflops, tbps = result
-    return f"{tflops:8.2f} TFLOPS ({tflops / PEAK_TFLOPS:6.1%})  {tbps:6.2f} TBPS ({tbps / PEAK_TBPS:6.1%})"
+def _bench_title(c: MLPConfig) -> str:
+    return (f"{c.name} MoE MM1 "
+            f"E={c.num_experts} "
+            f"EP={c.experts_per_token} "
+            f"TP={c.num_expert_shards} "
+            f"B={c.hidden_size}x{c.intermediate_size}")
 
 
-def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False):
-    batch_sizes = get_batch_sizes(c)
+def _format_perf(result: tuple[float, float, float]) -> str:
+    tflops, tbps, us = result
+    return (f"{tflops:8.2f} TFLOPS ({tflops / PEAK_TFLOPS:6.1%})  "
+            f"{tbps:6.2f} TBPS ({tbps / PEAK_TBPS:6.1%})  "
+            f"{us:8.1f} us")
+
+
+def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False,
+          batch_sizes: tuple[int, ...] | None = None, skip_reference: bool = False,
+          kernel_config: KernelConfig | None = None):
+    batch_sizes = get_batch_sizes(c) if batch_sizes is None else batch_sizes
     batch_width = max(len("batch_size"), *(len(str(bs)) for bs in batch_sizes))
     perf_width = max(
         len("reference"),
-        len(_format_perf((99999.99, 999.99))),
+        len(_format_perf((99999.99, 999.99, 99999.9))),
     )
 
-    print(BENCH_TITLE, flush=True)
+    print(_bench_title(c), flush=True)
     print(f"Peak: {PEAK_TFLOPS / 1000:g} PFLOPS, {PEAK_TBPS:g} TBPS", flush=True)
     print(
         f"{'batch_size':>{batch_width}}  {'example':>{perf_width}}  {'reference':>{perf_width}}",
@@ -1600,10 +1612,15 @@ def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False):
             batch_size,
             device=device,
             uniform_routing=uniform_routing,
+            p=kernel_config,
         )
         flops, nbytes = estimate_benchmark_work(c, prepared)
         example = benchmark_kernel(prepared, matmul, flops, nbytes)
         print(f"{_format_perf(example):>{perf_width}}  ", end="", flush=True)
+
+        if skip_reference:
+            print(f"{'skipped':>{perf_width}}", flush=True)
+            continue
 
         prepared = prepare_case(
             c,
@@ -1618,4 +1635,44 @@ def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False):
 
 
 if __name__ == "__main__":
-    bench(uniform_routing=False)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MoE BMM1 fused-gather Gluon example")
+    parser.add_argument("--hidden", type=int, default=GPT_OSS_120B_CONFIG.hidden_size)
+    parser.add_argument("--inter", type=int, default=GPT_OSS_120B_CONFIG.intermediate_size)
+    parser.add_argument("--tokens", type=int, default=None, help="Token/batch size. Default: sweep.")
+    parser.add_argument("--topk", "--ep", dest="topk", type=int, default=GPT_OSS_120B_CONFIG.experts_per_token,
+                        help="Experts per token (EP / top-k).")
+    parser.add_argument("--num-experts", type=int, default=GPT_OSS_120B_CONFIG.num_experts)
+    parser.add_argument("--tp", "--num-expert-shards", dest="num_expert_shards", type=int,
+                        default=GPT_OSS_120B_CONFIG.num_expert_shards,
+                        help="Expert-shard / tensor-parallel degree (local experts = E / TP).")
+    parser.add_argument("--uniform-routing", action="store_true")
+    parser.add_argument("--skip-reference", action="store_true")
+    parser.add_argument("--block-n", type=int, default=None,
+                        help="Override kernel BLOCK_N (use 256 when N is not tiled by 512).")
+    parser.add_argument("--num-ctas", type=int, default=None, help="Override kernel NUM_CTAS.")
+    args = parser.parse_args()
+    c = MLPConfig(
+        name="custom",
+        num_experts=args.num_experts,
+        experts_per_token=args.topk,
+        num_expert_shards=args.num_expert_shards,
+        hidden_size=args.hidden,
+        intermediate_size=args.inter,
+    )
+    batch_sizes = None if args.tokens is None else (args.tokens, )
+    kernel_config = None
+    if args.block_n is not None or args.num_ctas is not None:
+        kernel_config = KernelConfig()
+        if args.block_n is not None:
+            kernel_config = replace(kernel_config, BLOCK_N=args.block_n)
+        if args.num_ctas is not None:
+            kernel_config = replace(kernel_config, NUM_CTAS=args.num_ctas)
+    bench(
+        c,
+        uniform_routing=args.uniform_routing,
+        batch_sizes=batch_sizes,
+        skip_reference=args.skip_reference,
+        kernel_config=kernel_config,
+    )
