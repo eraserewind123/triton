@@ -21,7 +21,7 @@ from triton_kernels.matmul import (
     matmul as reference_matmul,
 )
 from triton_kernels.numerics import InFlexData, OutFlexData
-from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE, downcast_to_mxfp
+from triton_kernels.numerics_details.mxfp import NVFP_BLOCK_SIZE, downcast_to_mxfp
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import (
     FP4,
@@ -31,8 +31,9 @@ from triton_kernels.tensor import (
     make_ragged_tensor_metadata,
     wrap_torch_tensor,
 )
-from triton_kernels.tensor_details.dtype import UINT8
+from triton_kernels.tensor_details.dtype import FP8_E4M3FN, UINT8
 from triton_kernels.tensor_details.layout import (
+    BlackwellActMXScaleLayout,
     BlackwellMX4ValueShuffledLayout,
     make_default_matmul_mxfp4_w_scale_layout,
 )
@@ -97,12 +98,14 @@ def unswizzle_mx_scale(
     smem,
     SIZE_OUTER: gl.constexpr,
     SIZE_INNER: gl.constexpr,
-    MXFP_BLOCK_SIZE: gl.constexpr,
+    SIZE_LANE: gl.constexpr,
 ):
+    # 5D cuBLAS scale tiles unswizzle with a 32-lane transform; SIZE_LANE is the
+    # swizzle structure, not the MX/NVFP vector size.
     rows: gl.constexpr = smem.shape[1]
     cols: gl.constexpr = smem.shape[2] * smem.shape[3] * smem.shape[4]
     tiles: gl.constexpr = cols // (SIZE_OUTER * SIZE_INNER)
-    smem = smem.reshape((rows, tiles, MXFP_BLOCK_SIZE, SIZE_OUTER // MXFP_BLOCK_SIZE, SIZE_INNER))
+    smem = smem.reshape((rows, tiles, SIZE_LANE, SIZE_OUTER // SIZE_LANE, SIZE_INNER))
     smem = smem.permute((0, 3, 2, 1, 4))
     return smem.reshape((rows * SIZE_OUTER, cols // SIZE_OUTER))
 
@@ -151,6 +154,7 @@ class PartitionArgs:
     x_desc: tma.tensor_descriptor
     w_desc: tma.tensor_descriptor
     scale_desc: tma.tensor_descriptor
+    x_scale_desc: tma.tensor_descriptor
     out_desc: tma.tensor_descriptor
     x_scale_ptr: gl.tensor | gl.constexpr
     w_scale_ptr: gl.tensor | gl.constexpr
@@ -163,8 +167,10 @@ class PartitionArgs:
     x_slice_sizes: gl.tensor
     x_slice_offs: gl.tensor
     x_block_schedule: gl.tensor
+    x_scale_block_offs: gl.tensor
 
     x_bufs: gl.shared_memory_descriptor
+    x_scale_bufs: gl.shared_memory_descriptor
     x_empty_bars: gl.shared_memory_descriptor
     x_ready_bars: gl.shared_memory_descriptor
     x_num_bufs: gl.constexpr
@@ -235,20 +241,30 @@ def issue_activation_tile(
     issued,
     offs_x_m,
     off_k_x,
-    tile_x_bytes: gl.constexpr,
+    scale_m_idx,
+    off_k_scale,
+    tile_bytes: gl.constexpr,
 ):
     empty_bar = p.x_empty_bars.index(idx)
     ready_bar = p.x_ready_bars.index(idx)
     x_buf = p.x_bufs.index(idx)
+    x_scale_buf = p.x_scale_bufs.index(idx)
 
     mbarrier.wait(empty_bar, phase, pred=issued >= p.x_num_bufs)
-    mbarrier.expect(ready_bar, tile_x_bytes)
+    mbarrier.expect(ready_bar, tile_bytes)
     tma.async_gather(
         p.x_desc,
         offs_x_m,
         off_k_x,
         ready_bar,
         x_buf,
+        multicast=p.USE_2CTA and p.X_GATHER_MULTICAST,
+    )
+    tma.async_load(
+        p.x_scale_desc,
+        [0, scale_m_idx, off_k_scale, 0, 0],
+        ready_bar,
+        x_scale_buf,
         multicast=p.USE_2CTA and p.X_GATHER_MULTICAST,
     )
 
@@ -264,6 +280,8 @@ def load_activations(p: PartitionArgs):
         parent=gl.BlockedLayout([1, 4], [32, 1], [1, gl.num_warps()], [1, 0], cga_layout=local_cga_layout),
     )
     tile_x_bytes: gl.constexpr = p.x_desc.block_type.nbytes * (p.BLOCK_M_PER_CTA if p.USE_2CTA else p.BLOCK_M)
+    tile_x_scale_bytes: gl.constexpr = p.x_scale_desc.nbytes_per_cta
+    tile_bytes: gl.constexpr = tile_x_bytes + tile_x_scale_bytes
 
     idx = 0
     phase = 1
@@ -305,8 +323,11 @@ def load_activations(p: PartitionArgs):
 
         for ki in range(p.K_TILES):
             tile_k = p.K_TILES - 1 - ki if p.REVERSE_K_TILES else ki
-            off_k_x = tile_k * p.BLOCK_K
-            idx, phase, issued = issue_activation_tile(p, idx, phase, issued, offs_x_m, off_k_x, tile_x_bytes)
+            off_k_x = tile_k * (p.BLOCK_K // 2)
+            off_k_scale = tile_k * p.BLOCK_K // (p.MXFP_BLOCK_SIZE * p.SCALE_SIZE_INNER)
+            scale_m_idx = gl.load(p.x_scale_block_offs + slice_idx) + off_m // p.SCALE_SIZE_OUTER
+            idx, phase, issued = issue_activation_tile(
+                p, idx, phase, issued, offs_x_m, off_k_x, scale_m_idx, off_k_scale, tile_bytes)
 
 
 @gluon.jit
@@ -371,14 +392,19 @@ def mma_partition(p: PartitionArgs):
             mbarrier.wait(w_ready_bar, w_phase)
 
             blackwell.tcgen05_copy(
-                unswizzle_mx_scale(scale_buf, p.SCALE_SIZE_OUTER, p.SCALE_SIZE_INNER, p.MXFP_BLOCK_SIZE),
+                unswizzle_mx_scale(scale_buf, p.SCALE_SIZE_OUTER, p.SCALE_SIZE_INNER, 32),
                 p.w_scale_tmem,
             )
 
             x_ready_bar = p.x_ready_bars.index(x_idx)
             x_empty_bar = p.x_empty_bars.index(x_idx)
             x_buf = p.x_bufs.index(x_idx)
+            x_scale_buf = p.x_scale_bufs.index(x_idx)
             mbarrier.wait(x_ready_bar, x_phase)
+            blackwell.tcgen05_copy(
+                unswizzle_mx_scale(x_scale_buf, p.SCALE_SIZE_OUTER, p.SCALE_SIZE_INNER, 32),
+                p.x_scale_tmem,
+            )
 
             mma_release_bars = [x_empty_bar, w_empty_bar] if p.INLINE_MMA_INPUT_RELEASE else None
             blackwell.tcgen05_mma_scaled(
@@ -388,7 +414,7 @@ def mma_partition(p: PartitionArgs):
                 p.w_scale_tmem,
                 p.x_scale_tmem,
                 a_type="e2m1",
-                b_type="e4m3",
+                b_type="e2m1",
                 use_acc=use_acc,
                 mbarriers=mma_release_bars,
             )
@@ -590,6 +616,7 @@ def ws_matmul_kernel(
     x_desc: tma.tensor_descriptor,
     w_desc: tma.tensor_descriptor,
     scale_desc: tma.tensor_descriptor,
+    x_scale_desc: tma.tensor_descriptor,
     out_desc: tma.tensor_descriptor,
     out_ptr: gl.tensor,
     #
@@ -602,6 +629,7 @@ def ws_matmul_kernel(
     x_slice_offs: gl.tensor,
     x_block_offs: gl.tensor,
     x_block_schedule: gl.tensor,
+    x_scale_block_offs: gl.tensor,
     #
     x_scale_ptr: gl.tensor,
     w_scale_ptr: gl.tensor,
@@ -675,6 +703,11 @@ def ws_matmul_kernel(
         [x_num_bufs, BLOCK_M, x_desc.block_type.shape[1]],
         x_desc.layout,
     )
+    x_scale_bufs = gl.allocate_shared_memory(
+        x_scale_desc.dtype,
+        [x_num_bufs] + x_scale_desc.block_type.shape,
+        x_scale_desc.layout,
+    )
     x_empty_bars, x_ready_bars = alloc_ring_barriers(x_num_bufs, consumer_two_ctas=use_2cta)
 
     w_num_bufs: gl.constexpr = W_NUM_BUFS
@@ -690,8 +723,8 @@ def ws_matmul_kernel(
     )
     w_empty_bars, w_ready_bars = alloc_ring_barriers(w_num_bufs, consumer_two_ctas=use_2cta)
 
-    x_scale_tmem = blackwell.allocate_tensor_memory(gl.uint8, [BLOCK_M, scale_k], x_scale_layout)
-    w_scale_tmem = blackwell.allocate_tensor_memory(gl.uint8, [BLOCK_N, scale_k], w_scale_layout)
+    x_scale_tmem = blackwell.allocate_tensor_memory(gl.float8e4nv, [BLOCK_M, scale_k], x_scale_layout)
+    w_scale_tmem = blackwell.allocate_tensor_memory(gl.float8e4nv, [BLOCK_N, scale_k], w_scale_layout)
 
     acc_num_bufs: gl.constexpr = ACC_NUM_BUFS
     acc_tmem = blackwell.allocate_tensor_memory(
@@ -701,12 +734,11 @@ def ws_matmul_kernel(
     )
     acc_empty_bars, acc_ready_bars = alloc_ring_barriers(acc_num_bufs, producer_two_ctas=use_2cta)
 
-    x_scale_tmem.store(gl.full((BLOCK_M, scale_k), 127, dtype=gl.uint8, layout=x_scale_tmem.get_reg_layout()))
-
     p = PartitionArgs(
         x_desc=x_desc,
         w_desc=w_desc,
         scale_desc=scale_desc,
+        x_scale_desc=x_scale_desc,
         out_desc=out_desc,
         x_scale_ptr=x_scale_ptr,
         w_scale_ptr=w_scale_ptr,
@@ -719,8 +751,10 @@ def ws_matmul_kernel(
         x_slice_sizes=x_slice_sizes,
         x_slice_offs=x_slice_offs,
         x_block_schedule=x_block_schedule,
+        x_scale_block_offs=x_scale_block_offs,
         #
         x_bufs=x_bufs,
+        x_scale_bufs=x_scale_bufs,
         x_empty_bars=x_empty_bars,
         x_ready_bars=x_ready_bars,
         x_num_bufs=x_num_bufs,
@@ -803,15 +837,19 @@ def make_tensor_descriptor(
     layout_shape = list(layout_block_shape or block_shape)
 
     if isinstance(t, Tensor) and t.dtype == FP4:
-        assert isinstance(t.storage.layout, BlackwellMX4ValueShuffledLayout)
-        assert layout_block_shape is None
-        desc_block_shape = t.storage.layout.swizzle_block_shape(desc_block_shape)
-        desc_block_shape[strides.index(1)] //= 2
-        layout_shape = desc_block_shape
+        if isinstance(t.storage.layout, BlackwellMX4ValueShuffledLayout):
+            assert layout_block_shape is None
+            desc_block_shape = t.storage.layout.swizzle_block_shape(desc_block_shape)
+            desc_block_shape[strides.index(1)] //= 2
+            layout_shape = desc_block_shape
+        else:
+            # Packed NVFP4 activations: storage is (..., K/2) uint8.
+            desc_block_shape = list(block_shape)
+            layout_shape = list(layout_block_shape or block_shape)
 
     rank = len(layout_shape)
-    if t.dtype == FP4:
-        assert rank == 5
+    tensor_dtype = t.dtype if isinstance(t, Tensor) else None
+    if tensor_dtype == FP4 and rank == 5:
         layout = gl.NVMMASharedLayout(
             swizzle_byte_width=128,
             element_bitwidth=8,
@@ -819,10 +857,26 @@ def make_tensor_descriptor(
             fp4_padded=True,
             cga_layout=cga_layout,
         )
-    elif t.dtype == UINT8:
-        assert rank == 5
+    elif tensor_dtype == FP4:
+        swizzle = 128 if layout_shape[-1] >= 128 else 64 if layout_shape[-1] >= 64 else 32
+        layout = gl.NVMMASharedLayout(
+            swizzle_byte_width=swizzle,
+            element_bitwidth=8,
+            rank=rank,
+            fp4_padded=False,
+            cga_layout=cga_layout,
+        )
+    elif rank == 5 and (tensor_dtype in (UINT8, FP8_E4M3FN) or
+                        (isinstance(t, torch.Tensor) and t.dtype in (torch.uint8, torch.float8_e4m3fn))):
         layout = gl.NVMMASharedLayout(
             swizzle_byte_width=0,
+            element_bitwidth=8,
+            rank=rank,
+            cga_layout=cga_layout,
+        )
+    elif tensor_dtype == FP8_E4M3FN or (isinstance(t, torch.Tensor) and t.dtype == torch.float8_e4m3fn):
+        layout = gl.NVMMASharedLayout(
+            swizzle_byte_width=0 if layout_shape[-1] <= 32 else min(128, layout_shape[-1]),
             element_bitwidth=8,
             rank=rank,
             cga_layout=cga_layout,
@@ -876,12 +930,12 @@ class KernelConfig:
     MAXNREG: int = None
     OCCUPANCY: int = 1
 
-    MXFP_BLOCK_SIZE: int = 32
+    MXFP_BLOCK_SIZE: int = NVFP_BLOCK_SIZE.value
     SCALE_SIZE_OUTER: int = 128
     SCALE_SIZE_INNER: int = 4
 
     def get_x_tile_smem(self) -> int:
-        return self.BLOCK_M * self.BLOCK_K
+        return self.BLOCK_M * (self.BLOCK_K // 2)
 
     def get_w_tile_smem(self) -> int:
         return self.BLOCK_N * self.BLOCK_K
@@ -1077,7 +1131,7 @@ def select_kernel_config(slice_size: int) -> KernelConfig:
 
 
 def matmul(
-    a: torch.Tensor,
+    a: torch.Tensor | Tensor,
     b: torch.Tensor | Tensor,
     bias: torch.Tensor,
     a_ragged_metadata: RaggedTensorMetadata,
@@ -1103,6 +1157,7 @@ def matmul(
     flex_ctx = precision_config.flex_ctx
 
     assert a.ndim == 2
+    assert isinstance(a, Tensor) and a.dtype == FP4
     _, k = a.shape
     _, _, n = b.shape
     m = gather_indx.shape[0]
@@ -1129,9 +1184,24 @@ def matmul(
 
     x_desc = make_tensor_descriptor(
         a,
-        (1, p.BLOCK_K),
-        layout_block_shape=(p.BLOCK_M, p.BLOCK_K),
+        (1, p.BLOCK_K // 2),
+        layout_block_shape=(p.BLOCK_M, p.BLOCK_K // 2),
         cga_layout=tuple((basis[0], 0) for basis in acc_cga_layout),
+    )
+    a_mx_scale = precision_config.a_mx_scale
+    assert a_mx_scale is not None
+    assert isinstance(a_mx_scale, Tensor)
+    assert isinstance(a_mx_scale.storage.layout, BlackwellActMXScaleLayout)
+    x_scale_desc = make_tensor_descriptor(
+        a_mx_scale,
+        (
+            1,
+            p.BLOCK_M // p.SCALE_SIZE_OUTER,
+            p.BLOCK_K // p.MXFP_BLOCK_SIZE // p.SCALE_SIZE_INNER,
+            2,
+            256,
+        ),
+        cga_layout=tuple((0, basis[0], 0, 0, 0) for basis in acc_cga_layout),
     )
     w_desc = make_tensor_descriptor(
         b,
@@ -1159,6 +1229,7 @@ def matmul(
         x_desc=x_desc,
         w_desc=w_desc,
         scale_desc=scale_desc,
+        x_scale_desc=x_scale_desc,
         out_desc=out_desc,
         out_ptr=c,
         #
@@ -1171,6 +1242,7 @@ def matmul(
         x_slice_offs=a_ragged_metadata.slice_offs,
         x_block_offs=x_block_offs,
         x_block_schedule=x_block_schedule,
+        x_scale_block_offs=a_ragged_metadata.block_offs(p.SCALE_SIZE_OUTER),
         #
         x_scale_ptr=flex_ctx.lhs_data.scale,
         w_scale_ptr=flex_ctx.rhs_data.scale,
@@ -1247,7 +1319,9 @@ def get_batch_sizes(c: MLPConfig) -> tuple[int, ...]:
 class PreparedCase:
     batch_size: int
     local_rank: int
-    x: torch.Tensor
+    x: Tensor
+    x_mx_scale: Tensor
+    x_mx_scale_token: Tensor
     w: Tensor
     w_scale: Tensor
     bias: torch.Tensor
@@ -1267,6 +1341,27 @@ def alloc_randn(shape: tuple[int, ...], dtype: torch.dtype, device: str) -> torc
     return torch.randn(shape, device=device, dtype=dtype)
 
 
+def alloc_randn_nvfp4_act(shape: tuple[int, ...], device: str) -> tuple[Tensor, Tensor]:
+    data = alloc_randn(shape, torch.bfloat16, device)
+    data, scale = downcast_to_mxfp(
+        data,
+        FP4,
+        axis=1,
+        scale_dtype=torch.float8_e4m3fn,
+        microblock_size=NVFP_BLOCK_SIZE.value,
+    )  # type: ignore[arg-type]
+    return wrap_torch_tensor(data, dtype=FP4), wrap_torch_tensor(scale)
+
+
+def pregather_nvfp4_act_scales(
+    scale: Tensor,
+    gather_indx: torch.Tensor,
+    ragged_metadata: RaggedTensorMetadata,
+) -> Tensor:
+    gathered = scale.storage.data[gather_indx]
+    return convert_layout(wrap_torch_tensor(gathered), BlackwellActMXScaleLayout(ragged_metadata))
+
+
 def alloc_randn_fp4(shape: tuple[int, ...], device: str, p: KernelConfig | None) -> tuple[Tensor, Tensor]:
     if p is not None:
         block_k, block_n, num_warps = p.BLOCK_K, p.BLOCK_N, p.NUM_WARPS
@@ -1274,7 +1369,13 @@ def alloc_randn_fp4(shape: tuple[int, ...], device: str, p: KernelConfig | None)
         block_k, block_n, num_warps = 128, 256, 8
 
     data = alloc_randn(shape, torch.bfloat16, device)
-    data, scale = downcast_to_mxfp(data, FP4, axis=1)  # type: ignore[arg-type]
+    data, scale = downcast_to_mxfp(
+        data,
+        FP4,
+        axis=1,
+        scale_dtype=torch.float8_e4m3fn,
+        microblock_size=NVFP_BLOCK_SIZE.value,
+    )  # type: ignore[arg-type]
     data_layout = BlackwellMX4ValueShuffledLayout(block_k=block_k, block_n=block_n)
     scale_layout = make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=num_warps)
     data = convert_layout(wrap_torch_tensor(data, dtype=FP4), data_layout)
@@ -1328,10 +1429,30 @@ def make_prod_like_logits(
     return logits.to(dtype)
 
 
+def make_balanced_logits(
+    batch_size: int,
+    num_experts: int,
+    experts_per_token: int,
+    device: str,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    # Match minimoe/w1w2_sep22 balanced_pipe_logits: for token t and slot k,
+    # expert (t * topk + k) % E gets a high logit so every expert gets exactly
+    # (batch_size * topk) / E tokens when that divides evenly.
+    logits = torch.full((batch_size, num_experts), -10.0, device=device, dtype=torch.float32)
+    tokens = torch.arange(batch_size, device=device)[:, None]
+    slots = torch.arange(experts_per_token, device=device)[None, :]
+    experts = (tokens * experts_per_token + slots) % num_experts
+    logits[tokens.expand_as(experts), experts] = 10.0 + (experts_per_token - slots).to(torch.float32) * 1.0e-3
+    return logits.to(dtype)
+
+
 def init_routing_data(c: MLPConfig, batch_size: int, local_rank: int, device: str,
-                      uniform_routing: bool) -> tuple[RaggedTensorMetadata, torch.Tensor]:
+                      routing: str = "prod") -> tuple[RaggedTensorMetadata, torch.Tensor]:
     expt_dist = make_expt_dict_uniform(c.num_expert_shards, c.num_experts)
-    if uniform_routing:
+    if routing == "balanced":
+        logits = make_balanced_logits(batch_size, c.num_experts, c.experts_per_token, device)
+    elif routing == "uniform":
         logits = torch.randn((batch_size, c.num_experts), dtype=torch.float16, device=device)
     else:
         logits = make_prod_like_logits(batch_size, c.num_experts, c.experts_per_token, device)
@@ -1346,16 +1467,20 @@ def init_routing_data(c: MLPConfig, batch_size: int, local_rank: int, device: st
     return ragged_metadata, gather_indx
 
 
-def prepare_case(c: MLPConfig, batch_size: int, device: str, seed: int = 0, uniform_routing: bool = False,
-                 reference: bool = False, p: KernelConfig | None = None) -> PreparedCase:
+def prepare_case(c: MLPConfig, batch_size: int, device: str, seed: int = 0, routing: str = "prod",
+                 uniform_routing: bool = False, reference: bool = False,
+                 p: KernelConfig | None = None) -> PreparedCase:
     torch.manual_seed(seed)
+    if uniform_routing:
+        routing = "uniform"
 
     local_rank = int(torch.randint(0, c.num_expert_shards, size=()).item())
     k, n = c.hidden_size, c.intermediate_size
     n_expts_local = c.num_experts // c.num_expert_shards
-    ragged_metadata, gather_indx = init_routing_data(c, batch_size, local_rank, device, uniform_routing)
+    ragged_metadata, gather_indx = init_routing_data(c, batch_size, local_rank, device, routing)
     p = None if reference else (p or select_kernel_config(ragged_metadata.expected_slice_size))
-    x = alloc_randn((batch_size, k), dtype=torch.float8_e4m3fn, device=device)
+    x, x_mx_scale_token = alloc_randn_nvfp4_act((batch_size, k), device=device)
+    x_mx_scale = pregather_nvfp4_act_scales(x_mx_scale_token, gather_indx, ragged_metadata)
     w, w_scale = alloc_randn_fp4((n_expts_local, k, n), device=device, p=p)
     bias = alloc_randn((n_expts_local, n), dtype=torch.float32, device=device)
 
@@ -1372,6 +1497,8 @@ def prepare_case(c: MLPConfig, batch_size: int, device: str, seed: int = 0, unif
         batch_size=batch_size,
         local_rank=local_rank,
         x=x,
+        x_mx_scale=x_mx_scale,
+        x_mx_scale_token=x_mx_scale_token,
         w=w,
         w_scale=w_scale,
         bias=bias,
@@ -1386,14 +1513,16 @@ def prepare_case(c: MLPConfig, batch_size: int, device: str, seed: int = 0, unif
     )
 
 
-def make_precision_config(prepared: PreparedCase) -> PrecisionConfig:
+def make_precision_config(prepared: PreparedCase, *, swizzled_act_scale: bool = True) -> PrecisionConfig:
     return PrecisionConfig(
         flexpoint_saturate_inf=True,
+        a_mx_scale=prepared.x_mx_scale if swizzled_act_scale else prepared.x_mx_scale_token,
+        a_microblock_size=NVFP_BLOCK_SIZE.value,
         b_mx_scale=prepared.w_scale,
-        b_microblock_size=MXFP_BLOCK_SIZE.value,
+        b_microblock_size=NVFP_BLOCK_SIZE.value,
         out_dtype=prepared.out_dtype,
         flex_ctx=FlexCtx(
-            lhs_data=InFlexData(dtype=prepared.out_dtype, scale=prepared.x_scale),
+            lhs_data=InFlexData(),
             rhs_data=InFlexData(),
             out_data=OutFlexData(dtype=prepared.out_dtype, expected_scale=prepared.y_scale),
         ),
@@ -1421,8 +1550,8 @@ def run_kernel(prepared: PreparedCase, kernel, precision_config: PrecisionConfig
 
 
 def run_provider(prepared: PreparedCase, provider: str) -> tuple[torch.Tensor, PrecisionConfig]:
-    precision_config = make_precision_config(prepared)
     kernel = matmul if provider == "example" else reference_matmul
+    precision_config = make_precision_config(prepared, swizzled_act_scale=(kernel is matmul))
     y = run_kernel(prepared, kernel, precision_config, make_output_buffer(prepared))
     return y, precision_config
 
@@ -1445,13 +1574,15 @@ def estimate_benchmark_work(c: MLPConfig, prepared: PreparedCase) -> tuple[int, 
         _storage_nbytes(t) // n_slices for t in (prepared.w, prepared.w_scale, prepared.bias))
 
     flops = 2 * n_tokens * k * n
-    nbytes = (n_tokens * k * prepared.x.element_size() + active_slice_bytes + n_tokens * out_n * torch.empty(
+    token_bytes = (_storage_nbytes(prepared.x) + _storage_nbytes(prepared.x_mx_scale_token)) // prepared.x.shape[0]
+    nbytes = (n_tokens * token_bytes + active_slice_bytes + n_tokens * out_n * torch.empty(
         (), dtype=prepared.out_dtype).element_size())
     return flops, nbytes
 
 
 def benchmark_kernel(prepared: PreparedCase, kernel, flops: int, nbytes: int) -> tuple[float, float, float]:
-    precision_config = make_precision_config(prepared)
+    # Reference matmul gathers token-order scales itself; Gluon expects pregathred/swizzled SFA.
+    precision_config = make_precision_config(prepared, swizzled_act_scale=(kernel is not reference_matmul))
     out = make_output_buffer(prepared)
     ms = do_bench_cudagraph(lambda: run_kernel(prepared, kernel, precision_config, out))
     seconds = ms * 1e-3
@@ -1537,8 +1668,10 @@ def test_op_fpsan():
             device=f"cuda:{torch.cuda.current_device()}",
             p=p,
         )
-        for off_k in range(0, prepared.x.shape[1], p.BLOCK_K):
-            prepared.x[:, off_k:off_k + p.BLOCK_K] = (448.0, 0.015625, -448.0, 1.0)[(off_k // p.BLOCK_K) % 4]
+        x_data = prepared.x.storage.data
+        packed_k = p.BLOCK_K // 2
+        for off_k in range(0, x_data.shape[1], packed_k):
+            x_data[:, off_k:off_k + packed_k] = (0x00, 0x11, 0xEE, 0xFF)[(off_k // packed_k) % 4]
         precision_config = make_precision_config(prepared)
         acc_fpsan_probe = torch.zeros(
             (prepared.out_shape[0], prepared.out_shape[1] * prepared.fused_activation.specs.reduction_n),
@@ -1585,9 +1718,11 @@ def _format_perf(result: tuple[float, float, float]) -> str:
             f"{us:8.1f} us")
 
 
-def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False,
-          batch_sizes: tuple[int, ...] | None = None, skip_reference: bool = False,
-          kernel_config: KernelConfig | None = None):
+def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, routing: str = "prod",
+          uniform_routing: bool = False, batch_sizes: tuple[int, ...] | None = None,
+          skip_reference: bool = False, kernel_config: KernelConfig | None = None):
+    if uniform_routing:
+        routing = "uniform"
     batch_sizes = get_batch_sizes(c) if batch_sizes is None else batch_sizes
     batch_width = max(len("batch_size"), *(len(str(bs)) for bs in batch_sizes))
     perf_width = max(
@@ -1596,7 +1731,7 @@ def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False,
     )
 
     print(_bench_title(c), flush=True)
-    print(f"Peak: {PEAK_TFLOPS / 1000:g} PFLOPS, {PEAK_TBPS:g} TBPS", flush=True)
+    print(f"Peak: {PEAK_TFLOPS / 1000:g} PFLOPS, {PEAK_TBPS:g} TBPS  routing={routing}", flush=True)
     print(
         f"{'batch_size':>{batch_width}}  {'example':>{perf_width}}  {'reference':>{perf_width}}",
         flush=True,
@@ -1611,7 +1746,7 @@ def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False,
             c,
             batch_size,
             device=device,
-            uniform_routing=uniform_routing,
+            routing=routing,
             p=kernel_config,
         )
         flops, nbytes = estimate_benchmark_work(c, prepared)
@@ -1626,7 +1761,7 @@ def bench(c: MLPConfig = GPT_OSS_120B_CONFIG, uniform_routing: bool = False,
             c,
             batch_size,
             device=device,
-            uniform_routing=uniform_routing,
+            routing=routing,
             reference=True,
         )
         flops, nbytes = estimate_benchmark_work(c, prepared)
@@ -1647,12 +1782,18 @@ if __name__ == "__main__":
     parser.add_argument("--tp", "--num-expert-shards", dest="num_expert_shards", type=int,
                         default=GPT_OSS_120B_CONFIG.num_expert_shards,
                         help="Expert-shard / tensor-parallel degree (local experts = E / TP).")
-    parser.add_argument("--uniform-routing", action="store_true")
+    parser.add_argument("--uniform-routing", action="store_true",
+                        help="Approx-uniform random logits (not exact balanced).")
+    parser.add_argument("--balanced-routing", action="store_true",
+                        help="Exact minimoe balanced routing: expert (t*topk+k)%%E.")
     parser.add_argument("--skip-reference", action="store_true")
     parser.add_argument("--block-n", type=int, default=None,
                         help="Override kernel BLOCK_N (use 256 when N is not tiled by 512).")
     parser.add_argument("--num-ctas", type=int, default=None, help="Override kernel NUM_CTAS.")
     args = parser.parse_args()
+    if args.uniform_routing and args.balanced_routing:
+        parser.error("use only one of --uniform-routing / --balanced-routing")
+    routing = "balanced" if args.balanced_routing else ("uniform" if args.uniform_routing else "prod")
     c = MLPConfig(
         name="custom",
         num_experts=args.num_experts,
@@ -1671,7 +1812,7 @@ if __name__ == "__main__":
             kernel_config = replace(kernel_config, NUM_CTAS=args.num_ctas)
     bench(
         c,
-        uniform_routing=args.uniform_routing,
+        routing=routing,
         batch_sizes=batch_sizes,
         skip_reference=args.skip_reference,
         kernel_config=kernel_config,

@@ -13,12 +13,12 @@ INTER="${INTER:-768}"
 TOKENS="${TOKENS:-8192}"
 HIDDEN="${HIDDEN:-3072}"
 # EP = experts per token (top-k). TP = expert shards (local experts = E / TP).
-EP="${EP:-${TOPK:-1}}"
+EP="${EP:-${TOPK:-8}}"
 TP="${TP:-${NUM_EXPERT_SHARDS:-1}}"
 NUM_EXPERTS="${NUM_EXPERTS:-256}"
 # BLOCK_N=512 (auto-selected for this token count) does not compile for N=768.
 BLOCK_N="${BLOCK_N:-256}"
-NUM_CTAS="${NUM_CTAS:-148}"
+NUM_CTAS="${NUM_CTAS:-1}"
 
 log() { echo "[moe-bmm1] $*"; }
 
